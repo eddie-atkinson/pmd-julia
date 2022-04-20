@@ -1,0 +1,10 @@
+Clear
+
+New Circuit.J  bus1=70 pu=1.08 basekV=0.400
+
+Redirect LineCodes.dss
+Redirect Lines.dss
+Redirect Loads.dss
+
+
+// Solve

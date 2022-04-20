@@ -1,0 +1,226 @@
+using JSON
+using PowerModelsDistribution
+import Ipopt
+using PyCall
+using JuMP
+using DataFrames
+using CSV
+
+
+
+phase_map = Dict{String,Number}(
+    "a" => 1,
+    "b" => 2,
+    "c" => 3
+)
+
+function write_json(val, path::String)
+    open(path, "w") do f
+        JSON.print(f, val)
+    end
+end
+
+function read_json(path::String)
+    open(path, "r") do f
+        JSON.parse(f)
+    end
+end
+
+
+function load_pp_pickle_model_sgen_json(network_name::String)
+    model_path = joinpath((pwd(), "networks", network_name, "pp_model", "model.p"))
+    # Need scipy and pandas to expand pp model pickles
+    PyCall.Conda.add("scipy")
+    PyCall.Conda.add("pandas")
+    py"""
+    import pickle
+    def load_pickle(path):
+        with open(path, "rb") as infile:
+            data = pickle.load(infile)
+        return data
+    """
+    load_pickle = py"load_pickle"
+    model = load_pickle(model_path)
+    model
+end
+
+
+function get_bus_index_name_map(network_name::String)
+    bus_path = joinpath((pwd(), "networks", network_name, "pp_model", "buses.json"))
+    buses = read_json(bus_path)
+    bus_index_name_map = Dict{Int64,String}()
+    for bus = values(buses)
+        bus_index_name_map[bus["index"]] = bus["name"]
+    end
+    bus_index_name_map
+end
+
+function move_loads_to_pp_phase(network_model::Dict{String,Any}, network_name::String)
+    base_path = joinpath((pwd(), "networks", network_name, "pp_model"))
+
+    loads_path = joinpath((base_path, "loads.json"))
+
+    loads = read_json(loads_path)
+
+    bus_index_name_map = get_bus_index_name_map(network_name)
+
+    # Assume each bus only has a single load
+    bus_name_phase_map = Dict{String,Int8}()
+    for load = values(loads)
+        bus_index = load["bus"]
+        phase = load["phase"]
+        bus_name = bus_index_name_map[bus_index]
+        phase_number = phase_map[phase]
+        bus_name_phase_map[bus_name] = phase_number
+    end
+
+    for (load_name, load) in network_model["load"]
+        bus_name = load["bus"]
+        phase_number = bus_name_phase_map[bus_name]
+        new_connections = [phase_number, 4]
+        network_model["load"][load_name]["connections"] = new_connections
+    end
+    nothing
+end
+
+
+function add_solar_network_model(network_model::Dict{String,Any}, pp_model, network_name::String)
+    asymmetric_sgen_data = pp_model["asymmetric_sgen"]["DF"]["data"]
+    asymmetric_sgen_columns = pp_model["asymmetric_sgen"]["DF"]["columns"]
+
+    name_index = findfirst(x -> x == "name", asymmetric_sgen_columns)
+    bus_index = findfirst(x -> x == "bus", asymmetric_sgen_columns)
+    bus_index_name_map = get_bus_index_name_map(network_name)
+
+    # Voltage source is ID 1 so start from 2
+    id = 2
+    for solar_gen in eachrow(asymmetric_sgen_data)
+        gen_bus_index = solar_gen[bus_index]
+        gen_bus_name = bus_index_name_map[gen_bus_index]
+        gen_phase_name = solar_gen[name_index]
+        gen_phase_number = phase_map[gen_phase_name]
+        add_solar!(
+            network_model,
+            "$id",
+            gen_bus_name,
+            [gen_phase_number, 4],
+            configuration=WYE,
+            pg_lb=[0.0],
+            pg_ub=[6.90],
+            # Back of the envelope calc
+            # TODO: actually set this properly
+            # qg_lb=[-4.14],
+            # qg_ub=[4.14],
+            # qg_lb=[-Inf],
+            # qg_ub=[Inf],
+            cost_pg_parameters=[0, 0, 0],
+        )
+        id += 1
+    end
+    nothing
+end
+
+
+function add_load_time_series(bus_name_index_map, network_model, active_df, reactive_df, start_index, stop_index)
+    time_series = network_model["time_series"]
+
+    active_rows = active_df[start_index:stop_index, :]
+    reactive_rows = reactive_df[start_index:stop_index, :]
+
+    for (load_id, load) in network_model["load"]
+        pd_nom_time_series_name = "pd_nom_load_$load_id"
+        qd_nom_time_series_name = "qd_nom_load_$load_id"
+
+        # Julia indexes from 1, but the pandapower indices start from 0
+        load_number = bus_name_index_map[load["bus"]] + 1
+        # This is disgusting, but subsets the df column into a vector
+        pd_nom_load = active_rows[:, load_number]
+        qd_nom_load = reactive_rows[:, load_number]
+
+        time_series[pd_nom_time_series_name] = Dict{String,Any}(
+            "replace" => true,
+            "time" => 1:size(active_rows)[1],
+            "values" => pd_nom_load
+        )
+
+        time_series[qd_nom_time_series_name] = Dict{String,Any}(
+            "replace" => true,
+            "time" => 1:size(reactive_rows)[1],
+            "values" => qd_nom_load
+        )
+
+        load["time_series"] = Dict(
+            "pd_nom" => pd_nom_time_series_name,
+            "qd_nom" => qd_nom_time_series_name
+        )
+    end
+    nothing
+end
+
+function add_solar_time_series(bus_name_index_map, network_model, pv_df, start_index, end_index)
+    time_series = network_model["time_series"]
+    pv_rows = pv_df[start_index:end_index, :]
+
+    for (solar_id, solar) in network_model["solar"]
+        pg_time_series_name = "pg_ub_solar_$solar_id"
+
+        # Julia indexes from 1, but the pandapower indices start from 0
+        solar_number = bus_name_index_map[solar["bus"]] + 1
+        pg_solar = pv_rows[:, solar_number]
+
+
+        time_series[pg_time_series_name] = Dict{String,Any}(
+            "replace" => true,
+            "time" => 1:size(pv_rows)[1],
+            "values" => pg_solar
+        )
+
+        solar["time_series"] = Dict(
+            "pg_ub" => pg_time_series_name
+        )
+    end
+    nothing
+end
+
+function add_time_series(network_name::String, network_model::Dict{String,Any}, active_df, reactive_df, pv_df, start_index, end_index)
+    networks_base_path = joinpath(pwd(), "networks", network_name, "pp_model")
+    bus_index_name_map = get_bus_index_name_map(network_name)
+    bus_name_index_map = Dict(value => key for (key, value) in bus_index_name_map)
+
+    network_model["time_series"] = Dict{String,Any}()
+
+    add_load_time_series(bus_name_index_map, network_model, active_df, reactive_df, start_index, end_index)
+    add_solar_time_series(bus_name_index_map, network_model, pv_df, start_index, end_index)
+
+    nothing
+end
+
+
+function add_solar_power_constraints(model::AbstractUnbalancedPowerModel, data_math::Dict{String,Any}, network_model::Dict{String,Any})
+    for gen = values(data_math["gen"])
+        # We don't want to constrain the voltage source
+        if ~occursin("solar", gen["source_id"])
+            continue
+        end
+        index = gen["index"]
+
+        # Want a scalar subexpression, not a vector
+        pg_opt_var = var(model, :pg, index)[1]
+        qg_opt_var = var(model, :qg, index)[1]
+
+        @NLconstraint(model.model, qg_opt_var^2 - 0.36 * pg_opt_var^2 <= 0)
+        @NLconstraint(model.model, pg_opt_var^2 - 0.96 * qg_opt_var^2 >= 0)
+    end
+end
+
+
+
+# for i = 1:3
+#     bus_54 = sol_eng["bus"]["54"]
+#     vi = bus_54["vi"][i]
+#     vr = bus_54["vr"][i]
+
+#     v = sqrt((vi^2) + (vr^2))
+
+#     print("phase $i: $v kV")
+# end

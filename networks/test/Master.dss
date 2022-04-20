@@ -1,0 +1,13 @@
+Clear
+
+New Circuit.test  bus1=70 pu=1.08 basekV=0.400
+
+// Define linecode
+New Linecode.3P_OH_Code0 units=km nphases=3 R1=0.37 R0=0.37 X1=0.359733 X0=0.4  BaseFreq=50
+
+
+// Line from bus 70 to bus 68
+New Line.L48375_68_70 Units=km Length=0.023 bus1=70.1.2.3 bus2=68.1.2.3 switch=n enabled=y phases=3 Linecode=3P_OH_Code0
+
+// Add load on bus 68
+New Load.13 bus1=68.1 kV=0.24999266655910796 Vminpu=0.7 Vmaxpu=1.3 model=1 kW=5.4 kvar=0.0 Phases=1
