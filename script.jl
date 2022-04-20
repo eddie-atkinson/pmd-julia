@@ -101,8 +101,8 @@ else
         print("\n")
         sol_eng = run_ts_model(network_name, network_model, start_idx, range_end, active_df, reactive_df, pv_df)
         write_json(sol_eng, "res-10.json")
-        # TODO: remove this
         nothing
+        # TODO: remove this
         break
     end
 end
