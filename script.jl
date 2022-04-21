@@ -1,10 +1,8 @@
 using Distributed
 addprocs(4)
-@everywhere using JSON
 @everywhere using PowerModelsDistribution
 @everywhere import Ipopt
 using PyCall
-@everywhere using JuMP
 
 # Include local modules
 @everywhere include("helpers.jl")
@@ -74,9 +72,8 @@ reactive_df = reactive_df .* 1000
 
 @everywhere function run_ts_model(network_name::String, network_model::Dict{String,Any}, start_index, end_index, active_df, reactive_df, pv_df)
     add_time_series(network_name, network_model, active_df, reactive_df, pv_df, start_index, end_index)
-    data_math = transform_data_model(network_model, kron_reduce=false, phase_project=false, multinetwork=true)
-    add_start_vrvi!(data_math)
-    model = instantiate_mc_model(data_math, IVRENPowerModel, build_mn_mc_opf)
+    data_math = transform_data_model(network_model, multinetwork=true)
+    model = instantiate_mc_model(data_math, IVRUPowerModel, build_mn_mc_opf)
     res = optimize_model!(model, optimizer=Ipopt.Optimizer)
     res_math = res["solution"]
 
@@ -86,7 +83,6 @@ reactive_df = reactive_df .* 1000
 end
 
 
-
 if RUN_DISTRIBUTED
     @sync @distributed for range_end = range(start=CHUNK_SIZE, stop=NUM_TS_ITERATIONS, step=CHUNK_SIZE)
         start_idx = range_end - (CHUNK_SIZE - 1)
@@ -94,16 +90,15 @@ if RUN_DISTRIBUTED
         nothing
     end
 else
-    print("running serial\n")
-    for range_end = range(start=CHUNK_SIZE, stop=NUM_TS_ITERATIONS, step=CHUNK_SIZE)
-        start_idx = range_end - (CHUNK_SIZE - 1)
-        print(range_end)
-        print("\n")
-        sol_eng = run_ts_model(network_name, network_model, start_idx, range_end, active_df, reactive_df, pv_df)
-        write_json(sol_eng, "res-10.json")
-        nothing
-        # TODO: remove this
-        break
-    end
+    print("Running serial\n")
+    bus_index_name_map = get_bus_index_name_map(network_name)
+    bus_name_index_map = Dict(value => key for (key, value) in bus_index_name_map)
+    add_time_series_single_step(network_model, bus_name_index_map, active_df, reactive_df, pv_df, 1800)
+    data_math = transform_data_model(network_model, multinetwork=true)
+    model = instantiate_mc_model(data_math, IVRUPowerModel, build_mn_mc_opf)
+    res = optimize_model!(model, optimizer=Ipopt.Optimizer)
+    res_math = res["solution"]
+    sol_eng = transform_solution(res_math, data_math, make_si=true)
+    write_results(network_name, sol_eng, "res-single-step")
+    write_json(sol_eng, "res-single-step.json")
 end
-

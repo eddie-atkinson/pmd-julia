@@ -113,7 +113,8 @@ function add_solar_network_model(network_model::Dict{String,Any}, pp_model, netw
             # qg_ub=[4.14],
             qg_lb=[-Inf],
             qg_ub=[Inf],
-            cost_pg_parameters=[0, 0, 0],
+            # Quadratic, linear, constant
+            cost_pg_parameters=[0, -1, 0],
         )
         id += 1
     end
@@ -182,7 +183,6 @@ function add_solar_time_series(bus_name_index_map, network_model, pv_df, start_i
 end
 
 function add_time_series(network_name::String, network_model::Dict{String,Any}, active_df, reactive_df, pv_df, start_index, end_index)
-    networks_base_path = joinpath(pwd(), "networks", network_name, "pp_model")
     bus_index_name_map = get_bus_index_name_map(network_name)
     bus_name_index_map = Dict(value => key for (key, value) in bus_index_name_map)
 
@@ -194,6 +194,33 @@ function add_time_series(network_name::String, network_model::Dict{String,Any}, 
     nothing
 end
 
+
+function add_load_time_series_single_step(bus_name_index_map::Dict{String,Int64}, network_model::Dict{String,Any}, active_df::DataFrame, reactive_df::DataFrame, step_index::Int64)
+
+    for (load_id, load) in network_model["load"]
+        # Julia indexes from 1, but the pandapower indices start from 0
+        load_number = bus_name_index_map[load["bus"]] + 1
+        load["pd_nom"] = [active_df[step_index, load_number]]
+        load["qd_nom"] = [reactive_df[step_index, load_number]]
+    end
+    nothing
+end
+
+
+function add_solar_time_series_single_step(bus_name_index_map::Dict{String,Int64}, network_model::Dict{String,Any}, pv_df::DataFrame, step_index::Int64)
+    for (solar_id, solar) in network_model["solar"]
+
+        # Julia indexes from 1, but the pandapower indices start from 0
+        solar_number = bus_name_index_map[solar["bus"]] + 1
+        solar["pg_ub"] = [pv_df[step_index, solar_number]]
+    end
+    nothing
+end
+
+function add_time_series_single_step(network_model::Dict{String,Any}, bus_name_index_map::Dict{String,Int64}, active_df::DataFrame, reactive_df::DataFrame, pv_df::DataFrame, step_index::Int64)
+    add_load_time_series_single_step(bus_name_index_map, network_model, active_df, reactive_df, step_index)
+    add_solar_time_series_single_step(bus_name_index_map, network_model, pv_df, step_index)
+end
 
 function add_solar_power_constraints(model::AbstractUnbalancedPowerModel, data_math::Dict{String,Any}, network_model::Dict{String,Any})
     for gen = values(data_math["gen"])

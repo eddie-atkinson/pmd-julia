@@ -1,0 +1,18 @@
+Clear
+Set DefaultBaseFreq=50
+New Circuit.ENWL_network_4_Feeder_4_4wire BasekV=11 pu=1.00 ISC3=3000 ISC1=2500
+
+Redirect Transformers.txt
+Redirect LineCode.txt
+Redirect Lines.txt
+! Redirect LoadShapes.txt
+Redirect Loads.txt
+New Energymeter.substation Element=Line.LINE1 1
+set mode=Daily number=288 stepsize=5m
+! solve
+! closedi
+
+! Original data from ENWL https://www.enwl.co.uk/go-net-zero/innovation/smaller-projects/low-carbon-networks-fund/low-voltage-network-solutions/
+
+! Four-wire cable data from Urquhart, Andrew J., and Murray Thomson. 2019. “Cable Impedance Data”. figshare. https://hdl.handle.net/2134/15544.
+! Creative Commons Attribution-NonCommercial 3.0 Unported License.
