@@ -105,14 +105,13 @@ function add_solar_network_model(network_model::Dict{String,Any}, pp_model, netw
             gen_bus_name,
             [gen_phase_number, 4],
             configuration=WYE,
+            # Not actually used in OPF but it complains if not set
+            pg=[0.0],
+            qg=[0.0],
             pg_lb=[0.0],
             pg_ub=[6.90],
-            # Back of the envelope calc
-            # TODO: actually set this properly
-            # qg_lb=[-4.14],
-            # qg_ub=[4.14],
-            qg_lb=[-Inf],
-            qg_ub=[Inf],
+            qg_lb=[-6.9],
+            qg_ub=[6.9],
             # Quadratic, linear, constant
             cost_pg_parameters=[0.0, -1.0, 0.0],
         )
@@ -197,11 +196,12 @@ end
 
 function add_load_time_series_single_step(bus_name_index_map::Dict{String,Int64}, network_model::Dict{String,Any}, active_df::DataFrame, reactive_df::DataFrame, step_index::Int64)
 
-    for (load_id, load) in network_model["load"]
+    for (_, load) in network_model["load"]
         # Julia indexes from 1, but the pandapower indices start from 0
         load_number = bus_name_index_map[load["bus"]] + 1
         load["pd_nom"] = [active_df[step_index, load_number]]
         load["qd_nom"] = [reactive_df[step_index, load_number]]
+
     end
     nothing
 end
@@ -277,13 +277,3 @@ function write_results(network_name::String, solution::Dict{String,Any}, output_
     CSV.write("$output_path-pv.csv", pv_df)
     CSV.write("$output_path-bus.csv", bus_df)
 end
-
-# for i = 1:3
-#     bus_54 = sol_eng["bus"]["54"]
-#     vi = bus_54["vi"][i]
-#     vr = bus_54["vr"][i]
-
-#     v = sqrt((vi^2) + (vr^2))
-
-#     print("phase $i: $v kV")
-# end
