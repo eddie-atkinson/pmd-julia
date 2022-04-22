@@ -49,7 +49,7 @@ add_start_vrvi!(data_math)
 
 model = instantiate_mc_model(data_math, IVRENPowerModel, build_mc_opf)
 
-add_solar_power_constraints(model, data_math, network_model)
+# add_solar_power_constraints(model, data_math, network_model)
 
 res = optimize_model!(model, optimizer=Ipopt.Optimizer)
 

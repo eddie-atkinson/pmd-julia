@@ -114,7 +114,7 @@ function add_solar_network_model(network_model::Dict{String,Any}, pp_model, netw
             qg_lb=[-Inf],
             qg_ub=[Inf],
             # Quadratic, linear, constant
-            cost_pg_parameters=[0, -1, 0],
+            cost_pg_parameters=[0.0, -1.0, 0.0],
         )
         id += 1
     end

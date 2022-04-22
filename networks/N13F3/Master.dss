@@ -13,9 +13,9 @@
 
 Clear
 Set DefaultBaseFreq=50
-New Circuit.ENWL_network_13_Feeder_3_kron BasekV=11 pu=1.00 ISC3=100000 ISC1=100000
+New Circuit.ENWL_network_13_Feeder_3_kron BasekV=0.4 pu=1.00 ISC3=1000 ISC1=1000
 
-Redirect Transformers.txt
+// Redirect Transformers.txt
 Redirect LineCode.txt
 Redirect Lines.txt
 Redirect Loads.txt
