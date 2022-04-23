@@ -92,17 +92,21 @@ function is_source(generator::Dict{String,Any})
 end
 
 function add_solar_power_constraints(model::AbstractUnbalancedPowerModel)
+
     for (id, gen) in ref(model)[:gen]
+        # Don't constrain the voltage source 
         if is_source(gen)
             continue
         end
-        pg_opt_var = var(model, :pg, id).data[1]
-        qg_opt_var = var(model, :qg, id).data[1]
+        pg_opt_var = [var(model, :pg, id)[c] for c in gen["connections"]]
+        qg_opt_var = [var(model, :qg, id)[c] for c in gen["connections"]]
 
         pmax = gen["pmax"][1]
         # Relies on sbase_default being 1
         # @NLconstraint(model.model, 0.64 * (pg_opt_var^2 + qg_opt_var^2) <= pg_opt_var^2)
-        @constraint(model.model, (pg_opt_var^2 + qg_opt_var^2) <= pmax^2)
+        @constraint(model.model, qg_opt_var .<= -tan(acos(0.8)) * pg_opt_var)
+        @constraint(model.model, qg_opt_var .>= -tan(acos(0.8)) * pg_opt_var)
+        @constraint(model.model, (pg_opt_var .^ 2 + qg_opt_var .^ 2) .<= pmax^2)
     end
 end
 
@@ -113,6 +117,7 @@ end
 dss_path = "networks/J/Master.dss"
 
 data_eng = parse_file(dss_path)
+data_eng["settings"]["sbase_default"] = 1.0
 join_lines_eng!(data_eng)
 
 # Remove the existing voltage bounds
@@ -147,8 +152,8 @@ pv_df = pv_df[:, Not(:datetime)]
 
 # The data is in MW we need it in kW
 pv_df = pv_df .* 1000
-active_df = active_df .* 1000
-reactive_df = reactive_df .* 1000
+active_df = active_df .* 1000 .* 0.8
+reactive_df = reactive_df .* 1000 .* 0.8
 
 load_buses = [load["bus"] for (load_name, load) in data_eng["load"]]
 bus_names = filter(x -> x !== "sourcebus", sort(load_buses))
@@ -156,9 +161,9 @@ bus_name_index_map = Dict{String,Int64}(bus_name => i - 1 for (i, bus_name) in e
 
 move_loads_to_pp_phase(data_eng, network_name)
 pp_model = load_pp_pickle_model_sgen_json(network_name)
-add_solar_network_model(data_eng, pp_model, network_name)
+# add_solar_network_model(data_eng, pp_model, network_name)
 
-add_time_series_single_step(data_eng, bus_name_index_map, active_df, reactive_df, pv_df, 1800)
+add_time_series_single_step(data_eng, bus_name_index_map, active_df, reactive_df, pv_df, 1)
 
 data_math = transform_data_model(data_eng)
 
@@ -180,19 +185,52 @@ b["vmax"] = 1.08 * [1, 1, 1]
 
 model = instantiate_mc_model(data_math, ACPUPowerModel, build_mc_opf)
 
-add_solar_power_constraints(model)
+# add_solar_power_constraints(model)
 
 
 result = optimize_model!(model, optimizer=Ipopt.Optimizer)
 
 sol_eng = transform_solution(result["solution"], data_math)
 
+@assert result["termination_status"] == PMD.LOCALLY_SOLVED
 
-for (sid, solar) in sol_eng["solar"]
-    pg = solar["pg"][1]
-    qg = solar["qg"][1]
-    s = sqrt(pg^2 + qg^2)
-    pf = pg / s
-    print("$sid PF = $pf")
-    print("\n")
+for (i, bus) in result["solution"]["bus"]
+    println(bus["vm"])
 end
+
+
+# println("PF")
+# for (sid, solar) in sol_eng["solar"]
+#     pg = solar["pg"][1]
+#     qg = solar["qg"][1]
+#     s = sqrt(pg^2 + qg^2)
+#     pf = pg / s
+#     pmax = data_eng["solar"][sid]["pg_ub"]
+#     println("$sid: $pf")
+#     # print("$sid PF = $pf")
+#     # print("\n")
+# end
+# println("P")
+# for (sid, solar) in sol_eng["solar"]
+#     pg = solar["pg"][1]
+#     qg = solar["qg"][1]
+#     s = sqrt(pg^2 + qg^2)
+#     pf = pg / s
+#     pmax = data_eng["solar"][sid]["pg_ub"]
+#     println("$sid: $pg $pmax")
+#     # print("$sid PF = $pf")
+#     # print("\n")
+# end
+# println("Q")
+# for (sid, solar) in sol_eng["solar"]
+#     pg = solar["pg"][1]
+#     qg = solar["qg"][1]
+#     s = sqrt(pg^2 + qg^2)
+#     pf = pg / s
+#     qmax = data_eng["solar"][sid]["qg_ub"]
+#     println("$sid: $qg $qmax")
+#     # print("$sid PF = $pf")
+#     # print("\n")
+# end
+
+

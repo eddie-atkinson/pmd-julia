@@ -188,7 +188,7 @@ function add_time_series(network_name::String, network_model::Dict{String,Any}, 
     network_model["time_series"] = Dict{String,Any}()
 
     add_load_time_series(bus_name_index_map, network_model, active_df, reactive_df, start_index, end_index)
-    add_solar_time_series(bus_name_index_map, network_model, pv_df, start_index, end_index)
+    # add_solar_time_series(bus_name_index_map, network_model, pv_df, start_index, end_index)
 
     nothing
 end
@@ -219,7 +219,7 @@ end
 
 function add_time_series_single_step(network_model::Dict{String,Any}, bus_name_index_map::Dict{String,Int64}, active_df::DataFrame, reactive_df::DataFrame, pv_df::DataFrame, step_index::Int64)
     add_load_time_series_single_step(bus_name_index_map, network_model, active_df, reactive_df, step_index)
-    add_solar_time_series_single_step(bus_name_index_map, network_model, pv_df, step_index)
+    # add_solar_time_series_single_step(bus_name_index_map, network_model, pv_df, step_index)
 end
 
 function add_solar_power_constraints(model::AbstractUnbalancedPowerModel, data_math::Dict{String,Any}, network_model::Dict{String,Any})
