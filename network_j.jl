@@ -1,120 +1,71 @@
 using PowerModelsDistribution
 using Ipopt
+using Dates
+using DataFrames
 include("helpers.jl")
 const PMD = PowerModelsDistribution
 
+# Various control variables for changing the program we are running
 network_name = "J"
-function _line_reverse_eng!(line)
-    prop_pairs = [("f_bus", "t_bus")]
-
-    for (x, y) in prop_pairs
-        tmp = line[x]
-        line[x] = line[y]
-        line[y] = tmp
-    end
-end
-
-function _get_required_buses_eng!(data_eng)
-    buses_exclude = []
-    for comp_type in ["load", "shunt", "generator", "voltage_source"]
-        if haskey(data_eng, comp_type)
-            buses_exclude = union(buses_exclude, [comp["bus"] for (_, comp) in data_eng[comp_type]])
-        end
-    end
-    if haskey(data_eng, "switch")
-        buses_exclude = union(buses_exclude, [sw["f_bus"] for (_, sw) in data_eng["switch"]])
-        buses_exclude = union(buses_exclude, [sw["t_bus"] for (_, sw) in data_eng["switch"]])
-    end
-    if haskey(data_eng, "transformer")
-        buses_exclude = union(buses_exclude, vcat([tr["bus"] for (_, tr) in data_eng["transformer"]]...))
-    end
-
-    return buses_exclude
-end
-
-function join_lines_eng!(data_eng)
-    @assert data_eng["data_model"] == ENGINEERING
-
-    # a bus is eligible for reduction if it only appears in exactly two lines
-    buses_all = collect(keys(data_eng["bus"]))
-    buses_exclude = _get_required_buses_eng!(data_eng)
-
-    # per bus, list all inbound or outbound lines
-    bus_lines = Dict(bus => [] for bus in buses_all)
-    for (id, line) in data_eng["line"]
-        push!(bus_lines[line["f_bus"]], id)
-        push!(bus_lines[line["t_bus"]], id)
-    end
-
-    # exclude all buses that do not have exactly two lines connected to it
-    buses_exclude = union(buses_exclude, [bus for (bus, lines) in bus_lines if length(lines) != 2])
-
-    # now loop over remaining buses
-    candidates = setdiff(buses_all, buses_exclude)
-    for bus in candidates
-        line1_id, line2_id = bus_lines[bus]
-        line1 = data_eng["line"][line1_id]
-        line2 = data_eng["line"][line2_id]
-
-        # reverse lines if needed to get the order
-        # (x)--fr-line1-to--(bus)--to-line2-fr--(x)
-        if line1["f_bus"] == bus
-            _line_reverse_eng!(line1)
-        end
-        if line2["f_bus"] == bus
-            _line_reverse_eng!(line2)
-        end
-
-        reducable = true
-        reducable = reducable && line1["linecode"] == line2["linecode"]
-        reducable = reducable && all(line1["t_connections"] .== line2["t_connections"])
-        if reducable
-
-            line1["length"] += line2["length"]
-            line1["t_bus"] = line2["f_bus"]
-            line1["t_connections"] = line2["f_connections"]
-
-            delete!(data_eng["line"], line2_id)
-            delete!(data_eng["bus"], bus)
-            for x in candidates
-                if line2_id in bus_lines[x]
-                    bus_lines[x] = [setdiff(bus_lines[x], [line2_id])..., line1_id]
-                end
-            end
-        end
-    end
-
-    return data_eng
-end
-
-function is_source(generator::Dict{String,Any})
-    return occursin("voltage_source", generator["source_id"])
-end
-
-function add_solar_power_constraints(model::AbstractUnbalancedPowerModel)
-
-    for (id, gen) in ref(model)[:gen]
-        # Don't constrain the voltage source 
-        if is_source(gen)
-            continue
-        end
-        pg_opt_var = [var(model, :pg, id)[c] for c in gen["connections"]]
-        qg_opt_var = [var(model, :qg, id)[c] for c in gen["connections"]]
-
-        pmax = gen["pmax"][1]
-        # Relies on sbase_default being 1
-        # @NLconstraint(model.model, 0.64 * (pg_opt_var^2 + qg_opt_var^2) <= pg_opt_var^2)
-        @constraint(model.model, qg_opt_var .<= -tan(acos(0.8)) * pg_opt_var)
-        @constraint(model.model, qg_opt_var .>= -tan(acos(0.8)) * pg_opt_var)
-        @constraint(model.model, (pg_opt_var .^ 2 + qg_opt_var .^ 2) .<= pmax^2)
-    end
-end
-
-
-##
-
+OPTIMAL_POWER_FLOW = false
+SOLAR = true
+N_ITER = 53760
 
 dss_path = "networks/J/Master.dss"
+
+function save_results(sol_eng, step, termination_status, bus_name_index_map, record_solar, load_df, bus_df, pv_df)
+    converged = termination_status == PMD.LOCALLY_SOLVED
+    for (load_name, load) in sol_eng["load"]
+        push!(
+            load_df,
+            Dict(
+                :step => step,
+                :load => load_name,
+                :qd => load["qd"][1],
+                :pd => load["pd"][1],
+                :converged => converged
+            ),
+        )
+    end
+    for (bus_name, bus) in sol_eng["bus"]
+        # Add a row for each phase
+        for i = 1:3
+            phase_voltage = bus["vm"][i]
+            bus_id = bus_name_index_map[bus_name]
+            push!(
+                bus_df,
+                Dict(
+                    :step => step,
+                    :bus => "$bus_id",
+                    :vm => phase_voltage,
+                    :phase => i,
+                    :converged => converged
+                ),
+            )
+        end
+    end
+    if record_solar
+        for (solar_name, solar) in sol_eng["solar"]
+            qg = solar["qg"][1]
+            pg = solar["pg"][1]
+            sg = sqrt(qg^2 + pg^2)
+            pf = pg / sg
+            push!(
+                pv_df,
+                Dict(
+                    :step => step,
+                    :solar => solar_name,
+                    :qg => qg,
+                    :pg => pg,
+                    :pf => pf,
+                    :converged => converged
+                ),
+            )
+        end
+    end
+end
+
+
 
 data_eng = parse_file(dss_path)
 data_eng["settings"]["sbase_default"] = 1.0
@@ -124,13 +75,15 @@ join_lines_eng!(data_eng)
 remove_all_bounds!(data_eng)
 
 
-# Add back the voltage bounds we care about
-add_bus_absolute_vbounds!(
-    data_eng,
-    phase_lb_pu=0.9,
-    phase_ub_pu=1.1,
-)
+if OPTIMAL_POWER_FLOW
+    # Add back the voltage bounds we care about
+    add_bus_absolute_vbounds!(
+        data_eng,
+        phase_lb_pu=0.9,
+        phase_ub_pu=1.1,
+    )
 
+end
 
 # cost_pg_parameters = [quadratic, linear, constant]
 # NB: constant term doesn't matter
@@ -145,6 +98,8 @@ pv_df = CSV.read(pv_path, DataFrame)
 active_df = CSV.read(active_path, DataFrame)
 reactive_df = CSV.read(reactive_path, DataFrame)
 
+# transform(pv_df, :datetime => ByRow(x -> DateTime(x, DateFormat("y-m-d H:M:S"))), renamecols=false)
+
 # Drop datetime, we don't need it
 active_df = active_df[:, Not(:datetime)]
 reactive_df = reactive_df[:, Not(:datetime)]
@@ -152,85 +107,71 @@ pv_df = pv_df[:, Not(:datetime)]
 
 # The data is in MW we need it in kW
 pv_df = pv_df .* 1000
-active_df = active_df .* 1000 .* 0.8
-reactive_df = reactive_df .* 1000 .* 0.8
+active_df = active_df .* 1000 .* 0.7
+reactive_df = reactive_df .* 1000 .* 0.7
 
 load_buses = [load["bus"] for (load_name, load) in data_eng["load"]]
-bus_names = filter(x -> x !== "sourcebus", sort(load_buses))
-bus_name_index_map = Dict{String,Int64}(bus_name => i - 1 for (i, bus_name) in enumerate(bus_names))
+bus_index_name_map = get_bus_index_name_map(network_name)
+bus_name_index_map = Dict{String,Int64}(value => key for (key, value) in bus_index_name_map)
 
 move_loads_to_pp_phase(data_eng, network_name)
-pp_model = load_pp_pickle_model_sgen_json(network_name)
-# add_solar_network_model(data_eng, pp_model, network_name)
 
-add_time_series_single_step(data_eng, bus_name_index_map, active_df, reactive_df, pv_df, 1)
-
-data_math = transform_data_model(data_eng)
-
-vsource_gen = findfirst(x -> contains(x["source_id"], "voltage_source.source"), data_math["gen"])
-vsource_bus = data_math["gen"][vsource_gen]["gen_bus"]
-vsource_branch = findfirst(x -> x["f_bus"] == vsource_bus, data_math["branch"])
-vsource_new_bus = data_math["branch"][vsource_branch]["t_bus"]
-data_math["gen"][vsource_gen]["gen_bus"] = vsource_new_bus
-delete!(data_math["bus"], vsource_bus)
-delete!(data_math["branch"], vsource_branch)
-# now set up the reference bus correctly
-b = data_math["bus"][string(vsource_new_bus)]
-b["vm"] = 1.08 * [1, 1, 1]
-b["va"] = [0, -2pi / 3, 2pi / 3]
-b["bus_type"] = 3
-b["vmin"] = 1.08 * [1, 1, 1]
-b["vmax"] = 1.08 * [1, 1, 1]
+bus_results_df = DataFrame(step=Vector{Int64}(), bus=Vector{String}(), phase=Vector{Int64}(), vm=Vector{Float64}(), converged=Vector{Bool}())
+load_results_df = DataFrame(step=Vector{Int64}(), load=Vector{String}(), qd=Vector{Float64}(), pd=Vector{Float64}(), converged=Vector{Bool}())
 
 
-model = instantiate_mc_model(data_math, ACPUPowerModel, build_mc_opf)
-
-# add_solar_power_constraints(model)
-
-
-result = optimize_model!(model, optimizer=Ipopt.Optimizer)
-
-sol_eng = transform_solution(result["solution"], data_math)
-
-@assert result["termination_status"] == PMD.LOCALLY_SOLVED
-
-for (i, bus) in result["solution"]["bus"]
-    println(bus["vm"])
+if SOLAR
+    add_solar_network_model(data_eng, network_name, OPTIMAL_POWER_FLOW)
+    pv_results_df = DataFrame(step=Vector{Int64}(), pf=Vector{Float64}(), solar=Vector{String}(), qg=Vector{Float64}(), pg=Vector{Float64}(), converged=Vector{Bool}())
 end
 
+for i = 480:490
 
-# println("PF")
-# for (sid, solar) in sol_eng["solar"]
-#     pg = solar["pg"][1]
-#     qg = solar["qg"][1]
-#     s = sqrt(pg^2 + qg^2)
-#     pf = pg / s
-#     pmax = data_eng["solar"][sid]["pg_ub"]
-#     println("$sid: $pf")
-#     # print("$sid PF = $pf")
-#     # print("\n")
-# end
-# println("P")
-# for (sid, solar) in sol_eng["solar"]
-#     pg = solar["pg"][1]
-#     qg = solar["qg"][1]
-#     s = sqrt(pg^2 + qg^2)
-#     pf = pg / s
-#     pmax = data_eng["solar"][sid]["pg_ub"]
-#     println("$sid: $pg $pmax")
-#     # print("$sid PF = $pf")
-#     # print("\n")
-# end
-# println("Q")
-# for (sid, solar) in sol_eng["solar"]
-#     pg = solar["pg"][1]
-#     qg = solar["qg"][1]
-#     s = sqrt(pg^2 + qg^2)
-#     pf = pg / s
-#     qmax = data_eng["solar"][sid]["qg_ub"]
-#     println("$sid: $qg $qmax")
-#     # print("$sid PF = $pf")
-#     # print("\n")
-# end
+    solar_ts_field = OPTIMAL_POWER_FLOW ? "pg_ub" : "pg"
+
+    add_load_time_series_single_step(bus_name_index_map, data_eng, active_df, reactive_df, i)
+    add_solar_time_series_single_step(bus_name_index_map, data_eng, pv_df, i, solar_ts_field)
+
+    data_math = transform_data_model(data_eng)
+
+    nw = data_math
+
+    vsource_gen = findfirst(x -> contains(x["source_id"], "voltage_source.source"), nw["gen"])
+    vsource_bus = nw["gen"][vsource_gen]["gen_bus"]
+    vsource_branch = findfirst(x -> x["f_bus"] == vsource_bus, nw["branch"])
+    vsource_new_bus = nw["branch"][vsource_branch]["t_bus"]
+    nw["gen"][vsource_gen]["gen_bus"] = vsource_new_bus
+    delete!(nw["bus"], vsource_bus)
+    delete!(nw["branch"], vsource_branch)
+    # now set up the reference bus correctly
+    b = nw["bus"][string(vsource_new_bus)]
+    b["vm"] = 1.08 * [1, 1, 1]
+    b["va"] = [0, -2pi / 3, 2pi / 3]
+    b["bus_type"] = 3
+    b["vmin"] = 1.08 * [1, 1, 1]
+    b["vmax"] = 1.08 * [1, 1, 1]
+
+    build_fn = OPTIMAL_POWER_FLOW ? build_mc_opf : build_mc_pf
+
+    model = instantiate_mc_model(data_math, ACPUPowerModel, build_fn)
+
+    if OPTIMAL_POWER_FLOW
+        add_solar_power_constraints(model)
+    end
 
 
+    result = optimize_model!(model, optimizer=Ipopt.Optimizer)
+
+    sol_eng = transform_solution(result["solution"], data_math)
+
+    save_results(sol_eng, i, result["termination_status"], bus_name_index_map, SOLAR, load_results_df, bus_results_df, pv_results_df)
+end
+
+pf_path_prefix = OPTIMAL_POWER_FLOW ? "opf" : "pf"
+solar_path_prefix = SOLAR ? "solar_true" : "solar_false"
+output_path = joinpath((pwd(), "simulation_results", "$pf_path_prefix-$solar_path_prefix"))
+
+
+CSV.write(joinpath((output_path, "load.csv")), load_results_df)
+CSV.write(joinpath((output_path, "pv.csv")), pv_results_df)
+CSV.write(joinpath((output_path, "bus.csv")), bus_results_df)

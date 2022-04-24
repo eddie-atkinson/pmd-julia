@@ -27,32 +27,11 @@ function read_json(path::String)
 end
 
 
-function load_pp_pickle_model_sgen_json(network_name::String)
-    model_path = joinpath((pwd(), "networks", network_name, "pp_model", "model.p"))
-    # Need scipy and pandas to expand pp model pickles
-    PyCall.Conda.add("scipy")
-    PyCall.Conda.add("pandas")
-    py"""
-    import pickle
-    def load_pickle(path):
-        with open(path, "rb") as infile:
-            data = pickle.load(infile)
-        return data
-    """
-    load_pickle = py"load_pickle"
-    model = load_pickle(model_path)
-    model
-end
-
 
 function get_bus_index_name_map(network_name::String)
-    bus_path = joinpath((pwd(), "networks", network_name, "pp_model", "buses.json"))
-    buses = read_json(bus_path)
-    bus_index_name_map = Dict{Int64,String}()
-    for bus = values(buses)
-        bus_index_name_map[bus["index"]] = bus["name"]
-    end
-    bus_index_name_map
+    bus_path = joinpath((pwd(), "networks", network_name, "pp_model", "bus_index_name_map.json"))
+    bus_map = read_json(bus_path)
+    Dict{Int64,String}(parse(Int64, key) => value for (key, value) in bus_map)
 end
 
 function move_loads_to_pp_phase(network_model::Dict{String,Any}, network_name::String)
@@ -62,14 +41,13 @@ function move_loads_to_pp_phase(network_model::Dict{String,Any}, network_name::S
 
     loads = read_json(loads_path)
 
-    bus_index_name_map = get_bus_index_name_map(network_name)
 
     # Assume each bus only has a single load
     bus_name_phase_map = Dict{String,Int8}()
-    for load = values(loads)
-        bus_index = load["bus"]
+    for load in loads
+        bus_index = load["bus_index"]
         phase = load["phase"]
-        bus_name = bus_index_name_map[bus_index]
+        bus_name = load["bus_name"]
         phase_number = phase_map[phase]
         bus_name_phase_map[bus_name] = phase_number
     end
@@ -84,20 +62,24 @@ function move_loads_to_pp_phase(network_model::Dict{String,Any}, network_name::S
 end
 
 
-function add_solar_network_model(network_model::Dict{String,Any}, pp_model, network_name::String)
-    asymmetric_sgen_data = pp_model["asymmetric_sgen"]["DF"]["data"]
-    asymmetric_sgen_columns = pp_model["asymmetric_sgen"]["DF"]["columns"]
+function add_solar_network_model(network_model::Dict{String,Any}, network_name::String, optimal_power_flow::Bool)
+    base_path = joinpath((pwd(), "networks", network_name, "pp_model"))
 
-    name_index = findfirst(x -> x == "name", asymmetric_sgen_columns)
-    bus_index = findfirst(x -> x == "bus", asymmetric_sgen_columns)
-    bus_index_name_map = get_bus_index_name_map(network_name)
+    solar_path = joinpath((base_path, "sgens.json"))
+
+    solar = read_json(solar_path)
+    qg_ub = optimal_power_flow ? [6.90] : [0.0]
+    qg_lb = optimal_power_flow ? [-6.90] : [0.0]
+
+    pg_ub = optimal_power_flow ? [6.90] : [0.0]
+    pg_lb = optimal_power_flow ? [0.0] : [0.0]
+
 
     # Voltage source is ID 1 so start from 2
     id = 2
-    for solar_gen in eachrow(asymmetric_sgen_data)
-        gen_bus_index = solar_gen[bus_index]
-        gen_bus_name = bus_index_name_map[gen_bus_index]
-        gen_phase_name = solar_gen[name_index]
+    for sgen in solar
+        gen_bus_name = sgen["bus_name"]
+        gen_phase_name = sgen["phase"]
         gen_phase_number = phase_map[gen_phase_name]
         add_solar!(
             network_model,
@@ -108,10 +90,10 @@ function add_solar_network_model(network_model::Dict{String,Any}, pp_model, netw
             # Not actually used in OPF but it complains if not set
             pg=[0.0],
             qg=[0.0],
-            pg_lb=[0.0],
-            pg_ub=[6.90],
-            qg_lb=[-6.9],
-            qg_ub=[6.9],
+            pg_lb=pg_lb,
+            pg_ub=pg_ub,
+            qg_lb=qg_lb,
+            qg_ub=qg_ub,
             # Quadratic, linear, constant
             cost_pg_parameters=[0.0, -1.0, 0.0],
         )
@@ -157,7 +139,7 @@ function add_load_time_series(bus_name_index_map, network_model, active_df, reac
     nothing
 end
 
-function add_solar_time_series(bus_name_index_map, network_model, pv_df, start_index, end_index)
+function add_solar_time_series(bus_name_index_map, network_model, pv_df, start_index, end_index, ts_field="pg_ub")
     time_series = network_model["time_series"]
     pv_rows = pv_df[start_index:end_index, :]
     for (solar_id, solar) in network_model["solar"]
@@ -175,7 +157,7 @@ function add_solar_time_series(bus_name_index_map, network_model, pv_df, start_i
         )
 
         solar["time_series"] = Dict(
-            "pg_ub" => pg_time_series_name
+            ts_field => pg_time_series_name
         )
     end
     nothing
@@ -188,7 +170,7 @@ function add_time_series(network_name::String, network_model::Dict{String,Any}, 
     network_model["time_series"] = Dict{String,Any}()
 
     add_load_time_series(bus_name_index_map, network_model, active_df, reactive_df, start_index, end_index)
-    # add_solar_time_series(bus_name_index_map, network_model, pv_df, start_index, end_index)
+    add_solar_time_series(bus_name_index_map, network_model, pv_df, start_index, end_index)
 
     nothing
 end
@@ -207,19 +189,20 @@ function add_load_time_series_single_step(bus_name_index_map::Dict{String,Int64}
 end
 
 
-function add_solar_time_series_single_step(bus_name_index_map::Dict{String,Int64}, network_model::Dict{String,Any}, pv_df::DataFrame, step_index::Int64)
-    for (solar_id, solar) in network_model["solar"]
-
-        # Julia indexes from 1, but the pandapower indices start from 0
-        solar_number = bus_name_index_map[solar["bus"]] + 1
-        solar["pg_ub"] = [pv_df[step_index, solar_number]]
+function add_solar_time_series_single_step(bus_name_index_map::Dict{String,Int64}, data_eng::Dict{String,Any}, pv_df::DataFrame, step_index::Int64, ts_field="pg_ub")
+    if haskey(data_eng, "solar")
+        for (_, solar) in data_eng["solar"]
+            # Julia indexes from 1, but the pandapower indices start from 0
+            solar_number = bus_name_index_map[solar["bus"]] + 1
+            solar[ts_field] = [pv_df[step_index, solar_number]]
+        end
     end
     nothing
 end
 
 function add_time_series_single_step(network_model::Dict{String,Any}, bus_name_index_map::Dict{String,Int64}, active_df::DataFrame, reactive_df::DataFrame, pv_df::DataFrame, step_index::Int64)
     add_load_time_series_single_step(bus_name_index_map, network_model, active_df, reactive_df, step_index)
-    # add_solar_time_series_single_step(bus_name_index_map, network_model, pv_df, step_index)
+    add_solar_time_series_single_step(bus_name_index_map, network_model, pv_df, step_index)
 end
 
 function add_solar_power_constraints(model::AbstractUnbalancedPowerModel, data_math::Dict{String,Any}, network_model::Dict{String,Any})
@@ -240,40 +223,107 @@ function add_solar_power_constraints(model::AbstractUnbalancedPowerModel, data_m
 end
 
 
-function write_results(network_name::String, solution::Dict{String,Any}, output_path::String)
-    bus_index_name_map = get_bus_index_name_map(network_name)
-    bus_name_index_map = Dict(value => key for (key, value) in bus_index_name_map)
-    # Assume we are using multinetwork and have at least one network
-    loads = keys(solution["nw"]["1"])
+function _line_reverse_eng!(line)
+    prop_pairs = [("f_bus", "t_bus")]
 
+    for (x, y) in prop_pairs
+        tmp = line[x]
+        line[x] = line[y]
+        line[y] = tmp
+    end
+end
 
-    bus_df = DataFrame(nw=Vector{String}(), bus=Vector{String}(), phase=Vector{Int64}(), voltage=Vector{Float64}())
-    load_df = DataFrame(nw=Vector{String}(), load=Vector{String}(), qd=Vector{Float64}(), pd=Vector{Float64}())
-    pv_df = DataFrame(nw=Vector{String}(), solar=Vector{String}(), qg=Vector{Float64}(), pg=Vector{Float64}())
-    for (network_id, network) in solution["nw"]
-        for (load_name, load) in network["load"]
-            push!(load_df, Dict(:nw => network_id, :load => load_name, :qd => load["qd"][1], :pd => load["pd"][1]))
+function _get_required_buses_eng!(data_eng)
+    buses_exclude = []
+    for comp_type in ["load", "shunt", "generator", "voltage_source"]
+        if haskey(data_eng, comp_type)
+            buses_exclude = union(buses_exclude, [comp["bus"] for (_, comp) in data_eng[comp_type]])
         end
-        for (solar_name, solar) in network["solar"]
-            push!(pv_df, Dict(:nw => network_id, :solar => solar_name, :qg => solar["qg"][1], :pg => solar["pg"][1]))
+    end
+    if haskey(data_eng, "switch")
+        buses_exclude = union(buses_exclude, [sw["f_bus"] for (_, sw) in data_eng["switch"]])
+        buses_exclude = union(buses_exclude, [sw["t_bus"] for (_, sw) in data_eng["switch"]])
+    end
+    if haskey(data_eng, "transformer")
+        buses_exclude = union(buses_exclude, vcat([tr["bus"] for (_, tr) in data_eng["transformer"]]...))
+    end
+
+    return buses_exclude
+end
+
+function join_lines_eng!(data_eng)
+    @assert data_eng["data_model"] == ENGINEERING
+
+    # a bus is eligible for reduction if it only appears in exactly two lines
+    buses_all = collect(keys(data_eng["bus"]))
+    buses_exclude = _get_required_buses_eng!(data_eng)
+
+    # per bus, list all inbound or outbound lines
+    bus_lines = Dict(bus => [] for bus in buses_all)
+    for (id, line) in data_eng["line"]
+        push!(bus_lines[line["f_bus"]], id)
+        push!(bus_lines[line["t_bus"]], id)
+    end
+
+    # exclude all buses that do not have exactly two lines connected to it
+    buses_exclude = union(buses_exclude, [bus for (bus, lines) in bus_lines if length(lines) != 2])
+
+    # now loop over remaining buses
+    candidates = setdiff(buses_all, buses_exclude)
+    for bus in candidates
+        line1_id, line2_id = bus_lines[bus]
+        line1 = data_eng["line"][line1_id]
+        line2 = data_eng["line"][line2_id]
+
+        # reverse lines if needed to get the order
+        # (x)--fr-line1-to--(bus)--to-line2-fr--(x)
+        if line1["f_bus"] == bus
+            _line_reverse_eng!(line1)
+        end
+        if line2["f_bus"] == bus
+            _line_reverse_eng!(line2)
         end
 
-        for (bus_name, bus) in network["bus"]
-            # Add a row for each phase
-            for i = 1:3
-                phase_vi = bus["vi"][i]
-                phase_vr = bus["vr"][i]
-                phase_voltage = sqrt(phase_vi^2 + phase_vr^2)
-                bus_id = bus_name_index_map[bus_name]
-                push!(bus_df, Dict(:nw => network_id, :bus => "$bus_id", :voltage => phase_voltage, :phase => i))
+        reducable = true
+        reducable = reducable && line1["linecode"] == line2["linecode"]
+        reducable = reducable && all(line1["t_connections"] .== line2["t_connections"])
+        if reducable
+
+            line1["length"] += line2["length"]
+            line1["t_bus"] = line2["f_bus"]
+            line1["t_connections"] = line2["f_connections"]
+
+            delete!(data_eng["line"], line2_id)
+            delete!(data_eng["bus"], bus)
+            for x in candidates
+                if line2_id in bus_lines[x]
+                    bus_lines[x] = [setdiff(bus_lines[x], [line2_id])..., line1_id]
+                end
             end
         end
     end
-    sort!(load_df, [:nw])
-    sort!(pv_df, [:nw])
-    sort!(bus_df, [:nw])
 
-    CSV.write("$output_path-load.csv", load_df)
-    CSV.write("$output_path-pv.csv", pv_df)
-    CSV.write("$output_path-bus.csv", bus_df)
+    return data_eng
+end
+
+function is_source(generator::Dict{String,Any})
+    return occursin("voltage_source", generator["source_id"])
+end
+
+function add_solar_power_constraints(model::AbstractUnbalancedPowerModel)
+
+    for (id, gen) in ref(model)[:gen]
+        # Don't constrain the voltage source 
+        if is_source(gen)
+            continue
+        end
+        pg_opt_var = [var(model, :pg, id)[c] for c in gen["connections"]]
+        qg_opt_var = [var(model, :qg, id)[c] for c in gen["connections"]]
+
+        pmax = gen["pmax"][1]
+
+        @constraint(model.model, qg_opt_var .<= -tan(acos(0.8)) * pg_opt_var)
+        @constraint(model.model, qg_opt_var .>= -tan(acos(0.8)) * pg_opt_var)
+        @constraint(model.model, (pg_opt_var .^ 2 + qg_opt_var .^ 2) .<= pmax^2)
+    end
 end
