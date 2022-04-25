@@ -8,14 +8,16 @@ const PMD = PowerModelsDistribution
 # Various control variables for changing the program we are running
 network_name = "J"
 OPTIMAL_POWER_FLOW = false
-SOLAR = true
+SOLAR = false
 N_ITER = 53760
 
 dss_path = "networks/J/Master.dss"
 
-function save_results(sol_eng, step, termination_status, bus_name_index_map, record_solar, load_df, bus_df, pv_df)
+function save_results(sol_eng, step, termination_status, bus_name_index_map, record_solar, load_df, bus_df, pv_df, data_eng)
     converged = termination_status == PMD.LOCALLY_SOLVED
     for (load_name, load) in sol_eng["load"]
+        load_bus_name = data_eng["load"]["$load_name"]["bus"]
+        load_bus_index = bus_name_index_map[load_bus_name]
         push!(
             load_df,
             Dict(
@@ -23,7 +25,9 @@ function save_results(sol_eng, step, termination_status, bus_name_index_map, rec
                 :load => load_name,
                 :qd => load["qd"][1],
                 :pd => load["pd"][1],
-                :converged => converged
+                :converged => converged,
+                :bus_name => load_bus_name,
+                :bus_index => load_bus_index,
             ),
         )
     end
@@ -36,7 +40,8 @@ function save_results(sol_eng, step, termination_status, bus_name_index_map, rec
                 bus_df,
                 Dict(
                     :step => step,
-                    :bus => "$bus_id",
+                    :bus_index => bus_id,
+                    :bus_name => bus_name,
                     :vm => phase_voltage,
                     :phase => i,
                     :converged => converged
@@ -48,6 +53,10 @@ function save_results(sol_eng, step, termination_status, bus_name_index_map, rec
         for (solar_name, solar) in sol_eng["solar"]
             qg = solar["qg"][1]
             pg = solar["pg"][1]
+            solar_bus_name = data_eng["solar"]["$solar_name"]["bus"]
+            solar_bus_index = bus_name_index_map[solar_bus_name]
+
+            pmax = data_eng["solar"]["$solar_name"]["pg_ub"][1]
             sg = sqrt(qg^2 + pg^2)
             pf = pg / sg
             push!(
@@ -58,7 +67,10 @@ function save_results(sol_eng, step, termination_status, bus_name_index_map, rec
                     :qg => qg,
                     :pg => pg,
                     :pf => pf,
-                    :converged => converged
+                    :converged => converged,
+                    :pmax => pmax,
+                    :bus_name => solar_bus_name,
+                    :bus_index => solar_bus_index,
                 ),
             )
         end
@@ -116,16 +128,16 @@ bus_name_index_map = Dict{String,Int64}(value => key for (key, value) in bus_ind
 
 move_loads_to_pp_phase(data_eng, network_name)
 
-bus_results_df = DataFrame(step=Vector{Int64}(), bus=Vector{String}(), phase=Vector{Int64}(), vm=Vector{Float64}(), converged=Vector{Bool}())
-load_results_df = DataFrame(step=Vector{Int64}(), load=Vector{String}(), qd=Vector{Float64}(), pd=Vector{Float64}(), converged=Vector{Bool}())
+bus_results_df = DataFrame(step=Vector{Int64}(), bus_index=Vector{Int64}(), bus_name=Vector{String}(), phase=Vector{Int64}(), vm=Vector{Float64}(), converged=Vector{Bool}())
+load_results_df = DataFrame(step=Vector{Int64}(), load=Vector{String}(), bus_index=Vector{Int64}(), bus_name=Vector{String}(), qd=Vector{Float64}(), pd=Vector{Float64}(), converged=Vector{Bool}())
+pv_results_df = SOLAR ? DataFrame(step=Vector{Int64}(), pf=Vector{Float64}(), solar=Vector{String}(), bus_index=Vector{Int64}(), bus_name=Vector{String}(), qg=Vector{Float64}(), pg=Vector{Float64}(), converged=Vector{Bool}(), pmax=Vector{Float64}()) : DataFrame()
 
 
 if SOLAR
     add_solar_network_model(data_eng, network_name, OPTIMAL_POWER_FLOW)
-    pv_results_df = DataFrame(step=Vector{Int64}(), pf=Vector{Float64}(), solar=Vector{String}(), qg=Vector{Float64}(), pg=Vector{Float64}(), converged=Vector{Bool}())
 end
 
-for i = 480:490
+for i = 1:N_ITER
 
     solar_ts_field = OPTIMAL_POWER_FLOW ? "pg_ub" : "pg"
 
@@ -164,7 +176,7 @@ for i = 480:490
 
     sol_eng = transform_solution(result["solution"], data_math)
 
-    save_results(sol_eng, i, result["termination_status"], bus_name_index_map, SOLAR, load_results_df, bus_results_df, pv_results_df)
+    save_results(sol_eng, i, result["termination_status"], bus_name_index_map, SOLAR, load_results_df, bus_results_df, pv_results_df, data_eng)
 end
 
 pf_path_prefix = OPTIMAL_POWER_FLOW ? "opf" : "pf"
