@@ -37,26 +37,15 @@ end
 function move_loads_to_pp_phase(network_model::Dict{String,Any}, network_name::String)
     base_path = joinpath((pwd(), "networks", network_name, "pp_model"))
 
-    loads_path = joinpath((base_path, "loads.json"))
+    loads_path = joinpath((base_path, "loads_pp.json"))
 
     loads = read_json(loads_path)
 
-
-    # Assume each bus only has a single load
-    bus_name_phase_map = Dict{String,Int8}()
-    for load in loads
-        bus_index = load["bus_index"]
-        phase = load["phase"]
-        bus_name = load["bus_name"]
-        phase_number = phase_map[phase]
-        bus_name_phase_map[bus_name] = phase_number
-    end
-
-    for (load_name, load) in network_model["load"]
-        bus_name = load["bus"]
-        phase_number = bus_name_phase_map[bus_name]
+    for (load_name, load) in loads
+        network_load = network_model["load"][load_name]
+        phase_number = phase_map[load["phase"]]
         new_connections = [phase_number, 4]
-        network_model["load"][load_name]["connections"] = new_connections
+        network_load["connections"] = new_connections
     end
     nothing
 end
@@ -65,7 +54,7 @@ end
 function add_solar_network_model(network_model::Dict{String,Any}, network_name::String, optimal_power_flow::Bool)
     base_path = joinpath((pwd(), "networks", network_name, "pp_model"))
 
-    solar_path = joinpath((base_path, "sgens.json"))
+    solar_path = joinpath((base_path, "sgens_pp.json"))
 
     solar = read_json(solar_path)
     qg_ub = optimal_power_flow ? [6.90] : [0.0]
@@ -75,15 +64,13 @@ function add_solar_network_model(network_model::Dict{String,Any}, network_name::
     pg_lb = optimal_power_flow ? [0.0] : [0.0]
 
 
-    # Voltage source is ID 1 so start from 2
-    id = 2
-    for sgen in solar
+    for (sgen_name, sgen) in solar
         gen_bus_name = sgen["bus_name"]
         gen_phase_name = sgen["phase"]
         gen_phase_number = phase_map[gen_phase_name]
         add_solar!(
             network_model,
-            "$id",
+            sgen_name,
             gen_bus_name,
             [gen_phase_number, 4],
             configuration=WYE,
@@ -97,7 +84,6 @@ function add_solar_network_model(network_model::Dict{String,Any}, network_name::
             # Quadratic, linear, constant
             cost_pg_parameters=[0.0, -1.0, 0.0],
         )
-        id += 1
     end
     nothing
 end
@@ -163,6 +149,26 @@ function add_solar_time_series(bus_name_index_map, network_model, pv_df, start_i
     nothing
 end
 
+function get_load_df_index_map(network_name::String)
+    path = joinpath((pwd(), "networks", "$network_name", "pp_model", "loads.json"))
+    loads = read_json(path)
+    df_map = Dict{String,Int64}()
+    for (i, load) in enumerate(loads)
+        df_map[load["name"]] = i - 1
+    end
+    df_map
+end
+
+function get_sgen_df_index_map(network_name::String)
+    path = joinpath((pwd(), "networks", "$network_name", "pp_model", "sgens_pp.json"))
+    sgens = read_json(path)
+    df_map = Dict{String,Int64}()
+    for (sgen_name, sgen) in sgens
+        df_map[sgen_name] = sgen["index"]
+    end
+    df_map
+end
+
 function add_time_series(network_name::String, network_model::Dict{String,Any}, active_df, reactive_df, pv_df, start_index, end_index)
     bus_index_name_map = get_bus_index_name_map(network_name)
     bus_name_index_map = Dict(value => key for (key, value) in bus_index_name_map)
@@ -176,11 +182,11 @@ function add_time_series(network_name::String, network_model::Dict{String,Any}, 
 end
 
 
-function add_load_time_series_single_step(bus_name_index_map::Dict{String,Int64}, network_model::Dict{String,Any}, active_df::DataFrame, reactive_df::DataFrame, step_index::Int64)
+function add_load_time_series_single_step(load_name_index_map::Dict{String,Int64}, network_model::Dict{String,Any}, active_df::DataFrame, reactive_df::DataFrame, step_index::Int64)
 
-    for (_, load) in network_model["load"]
-        # Julia indexes from 1, but the pandapower indices start from 0
-        load_number = bus_name_index_map[load["bus"]] + 1
+    for (load_name, load) in network_model["load"]
+        # Indexing from 0 in python byt not here
+        load_number = load_name_index_map[load_name] + 1
         load["pd_nom"] = [active_df[step_index, load_number]]
         load["qd_nom"] = [reactive_df[step_index, load_number]]
 
@@ -189,11 +195,11 @@ function add_load_time_series_single_step(bus_name_index_map::Dict{String,Int64}
 end
 
 
-function add_solar_time_series_single_step(bus_name_index_map::Dict{String,Int64}, data_eng::Dict{String,Any}, pv_df::DataFrame, step_index::Int64, ts_field="pg_ub")
+function add_solar_time_series_single_step(load_name_index_map::Dict{String,Int64}, data_eng::Dict{String,Any}, pv_df::DataFrame, step_index::Int64, ts_field="pg_ub")
     if haskey(data_eng, "solar")
-        for (_, solar) in data_eng["solar"]
-            # Julia indexes from 1, but the pandapower indices start from 0
-            solar_number = bus_name_index_map[solar["bus"]] + 1
+        for (solar_name, solar) in data_eng["solar"]
+            # Python vs julia indexing need to add one
+            solar_number = load_name_index_map[solar_name] + 1
             solar[ts_field] = [pv_df[step_index, solar_number]]
         end
     end
@@ -205,22 +211,6 @@ function add_time_series_single_step(network_model::Dict{String,Any}, bus_name_i
     add_solar_time_series_single_step(bus_name_index_map, network_model, pv_df, step_index)
 end
 
-function add_solar_power_constraints(model::AbstractUnbalancedPowerModel, data_math::Dict{String,Any}, network_model::Dict{String,Any})
-    for gen = values(data_math["gen"])
-        # We don't want to constrain the voltage source
-        if ~occursin("solar", gen["source_id"])
-            continue
-        end
-        index = gen["index"]
-
-        # Want a scalar subexpression, not a vector
-        pg_opt_var = var(model, :pg, index)[1]
-        qg_opt_var = var(model, :qg, index)[1]
-
-        @NLconstraint(model.model, qg_opt_var^2 - 0.36 * pg_opt_var^2 <= 0)
-        @NLconstraint(model.model, pg_opt_var^2 - 0.96 * qg_opt_var^2 >= 0)
-    end
-end
 
 
 function _line_reverse_eng!(line)
